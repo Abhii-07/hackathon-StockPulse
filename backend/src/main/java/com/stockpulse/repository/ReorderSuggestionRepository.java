@@ -15,4 +15,6 @@ public interface ReorderSuggestionRepository extends JpaRepository<ReorderSugges
     
     Optional<ReorderSuggestion> findByProductIdAndTriggerReasonAndStatus(
         Long productId, TriggerReason triggerReason, SuggestionStatus status);
+    boolean existsByProductIdAndTriggerReasonAndStatus(
+        Long productId, TriggerReason triggerReason, SuggestionStatus status);
 }
