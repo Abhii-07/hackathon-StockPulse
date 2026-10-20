@@ -1,74 +1,78 @@
 package com.stockpulse.service;
 
-import com.stockpulse.entity.Product;
-import com.stockpulse.entity.PricingSuggestion;
-import com.stockpulse.entity.ReorderSuggestion;
-import com.stockpulse.entity.enums.TriggerReason;
-import com.stockpulse.repository.ProductRepository;
-import com.stockpulse.repository.PricingSuggestionRepository;
-import com.stockpulse.repository.ReorderSuggestionRepository;
+import com.stockpulse.entity.*;
+import com.stockpulse.entity.enums.*;
+import com.stockpulse.repository.*;
 import com.stockpulse.service.advisor.CommerceAdvisor;
 import lombok.RequiredArgsConstructor;
-import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.server.ResponseStatusException;
+import java.util.List;
 
-@Slf4j
 @Service
 @RequiredArgsConstructor
 public class SuggestionServiceImpl implements SuggestionService {
+    private final ProductRepository products;
+    private final PricingSuggestionRepository pricing;
+    private final ReorderSuggestionRepository reorders;
+    private final CommerceAdvisor advisor;
 
-    private final ProductRepository productRepository;
-    private final PricingSuggestionRepository pricingSuggestionRepository;
-    private final ReorderSuggestionRepository reorderSuggestionRepository;
-    private final CommerceAdvisor commerceAdvisor;
-
-    @Override
-    public PricingSuggestion generatePricingSuggestion(Long productId) {
-        log.info("Generating pricing suggestion for product ID: {}", productId);
-        
-        // Load the product
-        Product product = productRepository.findById(productId)
-                .orElseThrow(() -> new RuntimeException("Product not found with ID: " + productId));
-        
-        // Check if a PENDING suggestion already exists for this product and trigger reason
-        if (pricingSuggestionRepository.existsByProductIdAndTriggerReasonAndStatus(
-                productId, TriggerReason.MANUAL, com.stockpulse.entity.enums.SuggestionStatus.PENDING)) {
-            throw new RuntimeException("A pending pricing suggestion already exists for this product");
-        }
-        
-        // Call the advisor to generate the suggestion
-        PricingSuggestion suggestion = commerceAdvisor.generatePricingSuggestion(product, TriggerReason.MANUAL);
-        
-        // Save the generated suggestion
-        PricingSuggestion savedSuggestion = pricingSuggestionRepository.save(suggestion);
-        
-        log.info("Saved pricing suggestion ID: {} for product ID: {}", savedSuggestion.getId(), productId);
-        
-        return savedSuggestion;
+    @Override @Transactional
+    public PricingSuggestion generatePricingSuggestion(Long id) {
+        Product p = products.findById(id).orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+        if (pricing.existsByProductIdAndTriggerReasonAndStatus(id, TriggerReason.MANUAL, SuggestionStatus.PENDING))
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Manual pricing suggestion already pending");
+        return pricing.save(advisor.generatePricingSuggestion(p, TriggerReason.MANUAL));
     }
-
-    @Override
-    public ReorderSuggestion generateReorderSuggestion(Long productId) {
-        log.info("Generating reorder suggestion for product ID: {}", productId);
-        
-        // Load the product
-        Product product = productRepository.findById(productId)
-                .orElseThrow(() -> new RuntimeException("Product not found with ID: " + productId));
-        
-        // Check if a PENDING suggestion already exists for this product and trigger reason
-        if (reorderSuggestionRepository.existsByProductIdAndTriggerReasonAndStatus(
-                productId, TriggerReason.MANUAL, com.stockpulse.entity.enums.SuggestionStatus.PENDING)) {
-            throw new RuntimeException("A pending reorder suggestion already exists for this product");
-        }
-        
-        // Call the advisor to generate the suggestion
-        ReorderSuggestion suggestion = commerceAdvisor.generateReorderSuggestion(product, TriggerReason.MANUAL);
-        
-        // Save the generated suggestion
-        ReorderSuggestion savedSuggestion = reorderSuggestionRepository.save(suggestion);
-        
-        log.info("Saved reorder suggestion ID: {} for product ID: {}", savedSuggestion.getId(), productId);
-        
-        return savedSuggestion;
+    @Override @Transactional
+    public ReorderSuggestion generateReorderSuggestion(Long id) {
+        Product p = products.findById(id).orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+        if (reorders.existsByProductIdAndTriggerReasonAndStatus(id, TriggerReason.MANUAL, SuggestionStatus.PENDING))
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Manual reorder suggestion already pending");
+        return reorders.save(advisor.generateReorderSuggestion(p, TriggerReason.MANUAL));
     }
+    private void validate(SuggestionStatus status) {
+        if (status == null || status == SuggestionStatus.PENDING)
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Choose ACCEPTED or REJECTED");
+    }
+    @Override @Transactional
+    public PricingSuggestion updatePricingSuggestionStatus(Long id, SuggestionStatus status) {
+        validate(status);
+        PricingSuggestion s = pricing.findLockedById(id)
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Suggestion not found"));
+        if (s.getStatus() != SuggestionStatus.PENDING)
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Suggestion already reviewed");
+        if (status == SuggestionStatus.ACCEPTED) {
+            Product p = products.findWithPessimisticLockById(s.getProduct().getId())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+            p.setCurrentPrice(s.getRecommendedPrice());
+            products.save(p);
+        }
+        s.setStatus(status);
+        return pricing.save(s);
+    }
+    @Override @Transactional
+    public ReorderSuggestion updateReorderSuggestionStatus(Long id, SuggestionStatus status) {
+        validate(status);
+        ReorderSuggestion s = reorders.findLockedById(id)
+            .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Suggestion not found"));
+        if (s.getStatus() != SuggestionStatus.PENDING)
+            throw new ResponseStatusException(HttpStatus.CONFLICT, "Suggestion already reviewed");
+        if (status == SuggestionStatus.ACCEPTED) {
+            Product p = products.findWithPessimisticLockById(s.getProduct().getId())
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
+            p.setStockLevel(Math.addExact(p.getStockLevel(), s.getRecommendedQuantity()));
+            if (p.getStockLevel() > 0 && p.getStatus() == ProductStatus.OUT_OF_STOCK)
+                p.setStatus(ProductStatus.ACTIVE);
+            products.save(p);
+        }
+        s.setStatus(status);
+        return reorders.save(s);
+    }
+    @Override @Transactional(readOnly=true)
+    public List<PricingSuggestion> getPendingPricingSuggestions() { return pricing.findByStatus(SuggestionStatus.PENDING); }
+    @Override @Transactional(readOnly=true)
+    public List<ReorderSuggestion> getPendingReorderSuggestions() { return reorders.findByStatus(SuggestionStatus.PENDING); }
 }

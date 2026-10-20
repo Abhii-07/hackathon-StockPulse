@@ -1,81 +1,73 @@
 package com.stockpulse.ai;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
-import org.springframework.web.client.RestClient;
-import org.springframework.web.client.RestClientResponseException;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.List;
+import java.util.Map;
 
 @Slf4j
 @Component
 public class LLMGateway {
-
-    private final RestClient restClient;
+    private final HttpClient client = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(4)).build();
+    private final ObjectMapper mapper;
     private final String apiKey;
     private final String model;
+    private final String baseUrl;
 
-    public LLMGateway(
-            @Value("${llm.base-url}") String baseUrl,
-            @Value("${llm.api-key}") String apiKey,
-            @Value("${llm.model}") String model) {
-        
-        this.restClient = RestClient.builder()
-                .baseUrl(baseUrl)
-                .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
-                .requestInterceptor((request, body, execution) -> {
-                    request.getHeaders().setContentType(MediaType.APPLICATION_JSON);
-                    return execution.execute(request, body);
-                })
-                .build();
-        
+    public LLMGateway(ObjectMapper mapper,
+                      @Value("${llm.api-key:}") String apiKey,
+                      @Value("${llm.model:gemini-2.5-flash}") String model,
+                      @Value("${llm.base-url:https://generativelanguage.googleapis.com/v1beta}") String baseUrl) {
+        this.mapper = mapper;
         this.apiKey = apiKey;
         this.model = model;
+        this.baseUrl = baseUrl.replaceAll("/+$", "");
     }
 
     public String generateContent(String prompt) {
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new IllegalStateException("LLM_API_KEY is missing");
+        }
         try {
-            log.debug("Calling Gemini API with prompt: {}", prompt);
-            
-            String url = String.format("/models/%s:generateContent?key=%s", model, apiKey);
-            
-            // Create the request body as per Gemini API specification
-            String requestBody = String.format("""
-                {
-                  "contents": [{
-                    "parts": [{
-                      "text": "%s"
-                    }]
-                  }],
-                  "generationConfig": {
-                    "temperature": 0.7,
-                    "maxOutputTokens": 1000
-                  }
-                }
-                """, prompt.replace("\"", "\\\""));
-            
-            log.debug("Request URL: {}", url);
-            log.debug("Request Body: {}", requestBody);
-            
-            String response = restClient.post()
-                    .uri(url)
-                    .body(requestBody)
-                    .retrieve()
-                    .body(String.class);
-            
-            log.debug("Received response from Gemini API: {}", response);
-            return response;
-            
-        } catch (RestClientResponseException e) {
-            log.error("Gemini API error: {}", e.getMessage());
-            log.error("Response body: {}", e.getResponseBodyAsString());
-            return null;
+            String json = mapper.writeValueAsString(Map.of(
+                    "contents", List.of(Map.of("parts", List.of(Map.of("text", prompt)))),
+                    "generationConfig", Map.of("temperature", 0.3, "maxOutputTokens", 2048)
+            ));
+            String apiBase = baseUrl.endsWith("/v1beta") ? baseUrl : baseUrl + "/v1beta";
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(URI.create(apiBase + "/models/" + model + ":generateContent"))
+                    .timeout(Duration.ofSeconds(12))
+                    .header("Content-Type", "application/json")
+                    .header("x-goog-api-key", apiKey)
+                    .POST(HttpRequest.BodyPublishers.ofString(json))
+                    .build();
+            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() < 200 || response.statusCode() >= 300) {
+                throw new IllegalStateException("Gemini HTTP " + response.statusCode());
+            }
+            JsonNode parts = mapper.readTree(response.body())
+                    .path("candidates").path(0).path("content").path("parts");
+            if (!parts.isArray()) throw new IllegalStateException("Gemini returned no content");
+            StringBuilder result = new StringBuilder();
+            for (JsonNode part : parts) {
+                if (part.path("text").isTextual()) result.append(part.path("text").asText());
+            }
+            if (result.length() == 0) throw new IllegalStateException("Gemini returned empty text");
+            return result.toString();
         } catch (Exception e) {
-            log.error("Error calling Gemini API: {}", e.getMessage(), e);
-            return null;
+            // Never log request URL, API key, or response body.
+            log.warn("Gemini call failed; rule fallback expected: {}", e.getClass().getSimpleName());
+            throw new IllegalStateException("Gemini call failed", e);
         }
     }
 }
