@@ -1,0 +1,16 @@
+# H2 database files
+*.mv.db
+*.trace.db
+backend/data/
+
+# Maven
+target/
+.mvn/wrapper/maven-wrapper.jar
+
+# IDE
+.idea/
+.vscode/
+
+# Environment variables
+.env
+.env.*
